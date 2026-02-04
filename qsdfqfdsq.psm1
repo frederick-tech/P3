@@ -2,7 +2,7 @@
 .SYNOPSIS
     Module de gestion des OUs (Architecture).
 .NOTES
-    Version : V5 (Correctif "Directory object not found" - Tri automatique)
+    Version : V6 (Débogage avancé + Protection contre les parents manquants)
 #>
 
 if (-not (Get-Module Module-Common)) {
@@ -18,12 +18,15 @@ function New-EcoTechOUStructure {
     
     try {
         $config = Get-EcoTechConfig
-        $domainDN = $config.DomainInfo.DN
+        $domainDN = $config.DomainInfo.DN.Trim() # Sécurité : On retire les espaces inutiles
         
-        # --- PHASE 1 : Structure de base (Avec TRI) ---
-        # CORRECTIF : On trie par la longueur du Parent. 
-        # Les parents (courts ou vides) seront traités AVANT les enfants (longs).
-        $SortedOUs = $config.OUStructure | Sort-Object { $_.Parent.Length }
+        Write-Host "Domaine cible : $domainDN" -ForegroundColor Gray
+
+        # --- PHASE 1 : Structure de base (OUs définies dans le PSD1) ---
+        # Tri intelligent : On traite d'abord les parents (chemin court), puis les enfants
+        $SortedOUs = $config.OUStructure | Sort-Object { 
+            if ($_.Parent) { $_.Parent.Length } else { 0 } 
+        }
 
         $total = $SortedOUs.Count
         $i = 0
@@ -32,29 +35,43 @@ function New-EcoTechOUStructure {
             $i++
             Write-Progress -Activity "Architecture de base" -Status "Traitement : $($ou.Name)" -PercentComplete (($i / $total) * 100)
 
-            # Construction du chemin parent
-            # Si le parent est vide dans le config, on tape à la racine du domaine
-            $Path = if ([string]::IsNullOrWhiteSpace($ou.Parent)) { $domainDN } else { "$($ou.Parent),$domainDN" }
-            $TargetOU = "OU=$($ou.Name),$Path"
-            
-            # Vérification de sécurité : Le Parent existe-t-il ?
-            if (-not (Get-ADObject -Identity $Path -ErrorAction SilentlyContinue)) {
-                Write-EcoLog -Message "ERREUR : Impossible de créer '$($ou.Name)' car le parent '$Path' n'existe pas encore." -Level Error -LogOnly
-                continue
+            # 1. Construction du chemin parent
+            # Si Parent est vide = Racine du domaine
+            if ([string]::IsNullOrWhiteSpace($ou.Parent)) { 
+                $Path = $domainDN 
+            } else { 
+                # Si le Parent contient déjà "DC=", c'est un chemin absolu (erreur config), sinon on ajoute le domaine
+                if ($ou.Parent -match "DC=") {
+                    $Path = $ou.Parent
+                } else {
+                    $Path = "$($ou.Parent),$domainDN"
+                }
             }
 
+            $TargetOU = "OU=$($ou.Name),$Path"
+            
+            # 2. Vérification CRITIQUE : Le dossier parent existe-t-il ?
+            if (-not (Get-ADObject -Identity $Path -ErrorAction SilentlyContinue)) {
+                Write-Host "  [ERREUR] Parent introuvable pour '$($ou.Name)'" -ForegroundColor Red
+                Write-Host "           Chemin cherché : $Path" -ForegroundColor Red
+                Write-EcoLog -Message "Echec création $($ou.Name) : Parent introuvable ($Path)" -Level Error -LogOnly
+                continue # On passe au suivant pour ne pas tout bloquer
+            }
+
+            # 3. Création de l'OU
             if (-not (Get-ADOrganizationalUnit -Identity $TargetOU -ErrorAction SilentlyContinue)) {
                 try {
                     New-ADOrganizationalUnit -Name $ou.Name -Path $Path -Description $ou.Description -ProtectedFromAccidentalDeletion $true -ErrorAction Stop
                     Write-EcoLog -Message "OU Base Créée : $($ou.Name)" -Level Success -LogOnly
                 } catch {
-                    Write-EcoLog -Message "Erreur création $($ou.Name) : $($_.Exception.Message)" -Level Error -LogOnly
+                    Write-Host "  [ERREUR] Echec création '$($ou.Name)' : $($_.Exception.Message)" -ForegroundColor Red
+                    Write-EcoLog -Message "Erreur API sur $($ou.Name) : $($_.Exception.Message)" -Level Error -LogOnly
                 }
             }
         }
         Write-Progress -Activity "Architecture de base" -Completed
 
-        # --- PHASE 2 : Création dynamique des Services (Sxx) ---
+        # --- PHASE 2 : Création dynamique des Services (Sxx) via CSV ---
         Write-Host "Vérification des Services (Sxx)..." -ForegroundColor Cyan
         
         $CSVPath = "$PSScriptRoot\Fiche_personnels.csv"
@@ -76,8 +93,8 @@ function New-EcoTechOUStructure {
                 $CodeService = if ($ValService -is [hashtable]) { $ValService.Code } else { $ValService }
                 
                 if ($CodeDept -and $CodeService) {
-                    # ON CHERCHE OÙ EST LE DÉPARTEMENT (Dxx)
-                    # Astuce : On cherche l'OU Dxx n'importe où dans le domaine pour trouver son vrai chemin
+                    # Recherche du vrai chemin du Département (Dxx) dans tout l'AD
+                    # Cela évite les erreurs si le Dxx a été déplacé ou si le chemin théorique est faux
                     $DeptOU = Get-ADOrganizationalUnit -Filter "Name -eq '$CodeDept'" -Properties DistinguishedName -ErrorAction SilentlyContinue
                     
                     if ($DeptOU) {
@@ -85,10 +102,15 @@ function New-EcoTechOUStructure {
                         $TargetSxx = "OU=$CodeService,$ParentPath"
                         
                         if (-not (Get-ADOrganizationalUnit -Identity $TargetSxx -ErrorAction SilentlyContinue)) {
-                            New-ADOrganizationalUnit -Name $CodeService -Path $ParentPath -Description $item.Service -ProtectedFromAccidentalDeletion $true
-                            Write-EcoLog -Message "OU Service Créée : $CodeService ($($item.Service)) dans $CodeDept" -Level Success -LogOnly
+                            try {
+                                New-ADOrganizationalUnit -Name $CodeService -Path $ParentPath -Description $item.Service -ProtectedFromAccidentalDeletion $true -ErrorAction Stop
+                                Write-EcoLog -Message "OU Service Créée : $CodeService ($($item.Service))" -Level Success -LogOnly
+                            } catch {
+                                Write-EcoLog -Message "Erreur création Service $CodeService : $($_.Exception.Message)" -Level Error -LogOnly
+                            }
                         }
                     } else {
+                        # Log silencieux si le département parent n'existe pas encore (peut arriver si Phase 1 a échoué)
                         Write-EcoLog -Message "Impossible de créer Sxx : Le département $CodeDept est introuvable." -Level Warning -LogOnly
                     }
                 }
@@ -98,25 +120,20 @@ function New-EcoTechOUStructure {
             Write-Warning "Fichier CSV introuvable."
         }
         
-        Write-Host "Architecture mise à jour avec succès." -ForegroundColor Green
-        Write-EcoLog -Message "Mise à jour architecture terminée." -Level Info -LogOnly
+        Write-Host "Opération terminée." -ForegroundColor Green
 
     } catch {
-        Write-Host "Erreur critique : $($_.Exception.Message)" -ForegroundColor Red
-        Write-EcoLog -Message "Erreur Structure OU : $($_.Exception.Message)" -Level Error
+        Write-Host "Erreur globale Module-OU : $($_.Exception.Message)" -ForegroundColor Red
+        Write-EcoLog -Message "Crash Module-OU : $($_.Exception.Message)" -Level Error
     }
 }
 
 function Remove-EcoTechEntireInfrastructure {
-    # ... (Garder votre fonction de suppression existante ou celle que je vous avais donnée précédemment) ...
-    # Je remets la version sécurisée pour être sûr :
     param()
-    
     Write-Host "ATTENTION : Suppression totale..." -ForegroundColor Red
     $confirm = Read-Host "Confirmez-vous ? (OUI)"
     if ($confirm -eq "OUI") {
         $config = Get-EcoTechConfig
-        # On cible les racines probables
         $Roots = @("ECOTECH", "UBIHARD", "STUDIODLIGHT") 
         foreach ($root in $Roots) {
             $Target = "OU=$root,$($config.DomainInfo.DN)"
