@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    Module de gestion des OUs (Architecture).
+    Module de gestion des OUs.
 .NOTES
-    Version : Classique (Lecture séquentielle du Config + Mode Silencieux)
+    Retour à la logique originale (stable) + Mode Silencieux
 #>
 
 if (-not (Get-Module Module-Common)) {
@@ -13,105 +13,112 @@ function New-EcoTechOUStructure {
     [CmdletBinding(SupportsShouldProcess=$true)]
     param()
     
+    # On affiche juste un titre propre
     Clear-Host
-    Write-Host "Mise à jour de l'architecture (Lecture Config)..." -ForegroundColor Cyan
+    Write-Host "Vérification de l'arborescence OU..." -ForegroundColor Cyan
     
     try {
         $config = Get-EcoTechConfig
         $domainDN = $config.DomainInfo.DN
         
-        $total = $config.OUStructure.Count
+        $created = 0
+        $updated = 0
+        $totalOUs = $config.OUStructure.Count
         $i = 0
-
-        # On parcourt simplement la liste définie dans le fichier de config.
-        # Si le fichier est bien ordonné (Parents en premier), aucune erreur ne surviendra.
+        
         foreach ($ou in $config.OUStructure) {
             $i++
-            Write-Progress -Activity "Architecture OU" -Status "$($ou.Name)" -PercentComplete (($i / $total) * 100)
+            # Barre de progression (ne pollue pas le log)
+            Write-Progress -Activity "Configuration des OUs" -Status "$($ou.Name)" -PercentComplete (($i / $totalOUs) * 100)
 
-            # 1. Définition du chemin Parent
-            if ([string]::IsNullOrWhiteSpace($ou.Parent)) {
-                # C'est une racine (ex: ECOTECH)
-                $Path = $domainDN
-            } else {
-                # C'est un enfant (ex: UX dans PAR, ou S01 dans D01)
-                # On gère le cas où le Parent est déjà écrit en format complet ou relatif
-                if ($ou.Parent -match "DC=") {
-                    $Path = $ou.Parent
-                } else {
-                    $Path = "$($ou.Parent),$domainDN"
-                }
+            # Construction du chemin
+            $Path = if ([string]::IsNullOrWhiteSpace($ou.Parent)) { $domainDN } else { "$($ou.Parent),$domainDN" }
+            
+            # Recherche de l'OU existante (au niveau spécifié uniquement) - VOTRE LOGIQUE
+            # Note : Si le parent n'existe pas encore, cette commande échouera et ira dans le Catch.
+            # Assurez-vous que le fichier Config est dans le bon ordre (Parents avant Enfants).
+            try {
+                $existing = Get-ADOrganizationalUnit -Filter "Name -eq '$($ou.Name)'" -SearchBase $Path -SearchScope OneLevel -ErrorAction Stop
+            } catch {
+                $existing = $null
             }
-            
-            # 2. Vérification et Création
-            $TargetOU = "OU=$($ou.Name),$Path"
-            
-            # On vérifie d'abord si le PARENT existe pour éviter le crash "Directory object not found"
-            if (Get-ADObject -Identity $Path -ErrorAction SilentlyContinue) {
-                
-                if (-not (Get-ADOrganizationalUnit -Identity $TargetOU -ErrorAction SilentlyContinue)) {
-                    try {
-                        New-ADOrganizationalUnit -Name $ou.Name -Path $Path -Description $ou.Description -ProtectedFromAccidentalDeletion $true -ErrorAction Stop
-                        # Succès : On loggue dans le fichier mais PAS à l'écran
-                        Write-EcoLog -Message "OU Créée : $($ou.Name)" -Level Success -LogOnly
-                    } catch {
-                        # Erreur technique précise
-                        Write-EcoLog -Message "Echec création $($ou.Name) : $($_.Exception.Message)" -Level Error -LogOnly
-                    }
-                } else {
-                    # L'OU existe déjà, on ne fait rien (ou on met à jour la description si besoin)
-                    # Write-EcoLog -Message "OU Existant : $($ou.Name)" -Level Info -LogOnly
-                }
 
+            if ($existing) {
+                # L'OU existe : on vérifie la description
+                if ($existing.Description -ne $ou.Description) {
+                    Set-ADOrganizationalUnit -Identity $existing.DistinguishedName -Description $ou.Description
+                    $updated++
+                    # Log silencieux
+                    Write-EcoLog -Message "OU Mise à jour : $($ou.Name)" -Level Info -LogOnly
+                }
             } else {
-                # Si le parent n'existe pas, c'est une erreur de configuration (ordre des lignes)
-                Write-Host "  [ALERTE] Parent introuvable pour '$($ou.Name)'" -ForegroundColor Yellow
-                Write-EcoLog -Message "Parent introuvable ($Path) pour l'OU $($ou.Name)" -Level Warning -LogOnly
+                # L'OU n'existe pas : création
+                try {
+                    New-ADOrganizationalUnit -Name $ou.Name -Path $Path -Description $ou.Description -ProtectedFromAccidentalDeletion $true -ErrorAction Stop
+                    $created++
+                    # Log silencieux
+                    Write-EcoLog -Message "OU Créée : $($ou.Name)" -Level Success -LogOnly
+                } catch {
+                    # Si ça plante ici, c'est souvent que le Parent n'existe pas
+                    Write-EcoLog -Message "Echec création $($ou.Name) (Parent absent ?) : $($_.Exception.Message)" -Level Error -LogOnly
+                }
             }
         }
         
-        Write-Progress -Activity "Architecture OU" -Completed
-        Write-Host "Architecture vérifiée." -ForegroundColor Green
-        Write-Host "Consultez les logs pour les détails." -ForegroundColor Gray
-
+        Write-Progress -Activity "Configuration des OUs" -Completed
+        
+        # Bilan propre à la fin
+        Write-Host ""
+        Write-Host "=== BILAN INFRASTRUCTURE ===" -ForegroundColor Cyan
+        Write-Host "  OUs créées       : $created"
+        Write-Host "  OUs mises à jour : $updated"
+        Write-Host "  Total traitées   : $totalOUs"
+        Write-Host ""
+        Write-Host "Appuyez sur Entrée pour continuer..." -ForegroundColor Gray
+        
     } catch {
-        Write-Host "Erreur globale : $($_.Exception.Message)" -ForegroundColor Red
+        # En cas de gros crash (ex: Config non chargée)
+        Write-Host "Erreur critique : $($_.Exception.Message)" -ForegroundColor Red
         Write-EcoLog -Message "Crash Module-OU : $($_.Exception.Message)" -Level Error
     }
 }
 
 function Remove-EcoTechEntireInfrastructure {
+    [CmdletBinding(SupportsShouldProcess=$true)]
     param()
-    Write-Host "ATTENTION : Suppression totale de l'infra ECOTECH..." -ForegroundColor Red
-    $confirm = Read-Host "Tapez OUI pour confirmer"
+    
+    Write-Host "ATTENTION : Suppression totale de l'infrastructure..." -ForegroundColor Red
+    $confirm = Read-Host "Confirmez-vous ? (Tapez OUI)"
     
     if ($confirm -eq "OUI") {
         $config = Get-EcoTechConfig
-        # On supprime les racines principales
-        $Roots = @("ECOTECH", "UBIHARD", "STUDIODLIGHT") 
-        foreach ($root in $Roots) {
-            $Target = "OU=$root,$($config.DomainInfo.DN)"
+        $racines = @("ECOTECH", "UBIHARD", "STUDIODLIGHT")
+        
+        foreach ($name in $racines) {
+            $Target = "OU=$name,$($config.DomainInfo.DN)"
             if (Get-ADOrganizationalUnit -Identity $Target -ErrorAction SilentlyContinue) {
                 try {
-                    # Déprotection récursive
+                    # Déverrouillage
                     Get-ADOrganizationalUnit -SearchBase $Target -Filter * | Set-ADObject -ProtectedFromAccidentalDeletion $false
                     # Suppression
                     Remove-ADOrganizationalUnit -Identity $Target -Recursive -Confirm:$false
-                    Write-Host "$root supprimé." -ForegroundColor Yellow
-                    Write-EcoLog -Message "Infra $root supprimée" -Level Warning -LogOnly
+                    
+                    Write-Host "$name supprimé." -ForegroundColor Yellow
+                    Write-EcoLog -Message "Infra $name supprimée." -Level Warning -LogOnly
                 } catch {
-                    Write-Host "Erreur suppression $root : $($_.Exception.Message)" -ForegroundColor Red
+                    Write-Host "Erreur suppression $name : $($_.Exception.Message)" -ForegroundColor Red
                 }
             }
         }
     }
 }
 
+
 function Show-OUMenu {
     do {
         Clear-Host
-        Write-Host "=== GESTION OUs (ARCHITECTURE) ==="
-        Write-Host "1. Initialiser/Mettre à jour l'infrastructure (Config)"
+        Write-Host "=== GESTION OU ==="
+        Write-Host "1. Initialiser/Mettre à jour toute l'infrastructure"
         Write-Host "2. [DANGER] Supprimer toute l'infrastructure" -ForegroundColor Red
         Write-Host ""
         Write-Host "Appuyez sur Entrée pour retourner" -ForegroundColor Gray
